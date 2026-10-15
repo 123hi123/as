@@ -222,8 +222,8 @@ mod tests {
         assert_eq!(systemd_quote("/usr/bin/as-shim"), "/usr/bin/as-shim");
         assert_eq!(systemd_quote("/home/a b/x"), "\"/home/a b/x\"");
         assert_eq!(systemd_quote("/h/100%"), "\"/h/100%%\"");
-        let u = unit_text(Path::new("/home/joe/.local/bin/as-shim"), Path::new("/c/config.toml"));
-        assert!(u.contains("ExecStart=/home/joe/.local/bin/as-shim run --config /c/config.toml\n"));
+        let u = unit_text(Path::new("/home/user/.local/bin/as-shim"), Path::new("/c/config.toml"));
+        assert!(u.contains("ExecStart=/home/user/.local/bin/as-shim run --config /c/config.toml\n"));
         assert!(u.contains("Restart=on-failure"));
     }
 }
