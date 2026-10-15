@@ -1,0 +1,40 @@
+[package]
+name = "as-shim"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "as = anthropic to stream: a tiny local proxy that keeps Claude Code requests streaming so Cloudflare never 524s them"
+repository = "https://github.com/123hi123/as"
+readme = "README.md"
+rust-version = "1.80"
+
+[[bin]]
+name = "as-shim"
+path = "src/main.rs"
+
+[lib]
+name = "as_shim"
+path = "src/lib.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+bytes = "1"
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+http-body-util = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal", "macros", "sync", "io-util"] }
+url = "2"
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
