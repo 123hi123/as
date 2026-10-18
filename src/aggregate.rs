@@ -126,7 +126,10 @@ fn strip_incomplete(t: &mut Vec<Tok>) {
             Some(Tok::Sep | Tok::Delim) => true,
             Some(Tok::Num(v)) if v.ends_with(['.', '-', '+', 'e', 'E']) => true,
             Some(Tok::Num(_) | Tok::Str(_)) => {
-                matches!(t.len().checked_sub(2).map(|i| &t[i]), Some(Tok::Delim | Tok::Brace('{')))
+                matches!(
+                    t.len().checked_sub(2).map(|i| &t[i]),
+                    Some(Tok::Delim | Tok::Brace('{'))
+                )
             }
             Some(_) => false,
         };
@@ -151,7 +154,11 @@ pub fn parse_partial_json(s: &str) -> Option<Value> {
             Tok::Brace('{') => closers.push('}'),
             Tok::Paren('[') => closers.push(']'),
             Tok::Brace(_) | Tok::Paren(_) => {
-                let want = if matches!(tok, Tok::Brace(_)) { '}' } else { ']' };
+                let want = if matches!(tok, Tok::Brace(_)) {
+                    '}'
+                } else {
+                    ']'
+                };
                 if let Some(i) = closers.iter().rposition(|&c| c == want) {
                     closers.remove(i);
                 }
@@ -214,7 +221,11 @@ pub enum Step {
 pub fn is_content_event(kind: &str) -> bool {
     matches!(
         kind,
-        "content_block_start" | "content_block_delta" | "content_block_stop" | "message_delta" | "message_stop"
+        "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "message_delta"
+            | "message_stop"
     )
 }
 
@@ -279,7 +290,10 @@ impl Aggregator {
                 self.message = Some(msg);
             }
             "content_block_start" => {
-                let idx = ev.get("index").and_then(|i| i.as_u64()).unwrap_or(self.blocks.len() as u64);
+                let idx = ev
+                    .get("index")
+                    .and_then(|i| i.as_u64())
+                    .unwrap_or(self.blocks.len() as u64);
                 let block = ev
                     .get("content_block")
                     .cloned()
@@ -319,7 +333,10 @@ impl Aggregator {
                     "text_delta" => append_str(obj, "text", s("text")),
                     "thinking_delta" => append_str(obj, "thinking", s("thinking")),
                     "signature_delta" => {
-                        obj.insert("signature".into(), Value::String(s("signature").to_string()));
+                        obj.insert(
+                            "signature".into(),
+                            Value::String(s("signature").to_string()),
+                        );
                     }
                     "input_json_delta" => block.json_buf.push_str(s("partial_json")),
                     "compaction_delta" => {
@@ -547,12 +564,25 @@ mod tests {
         assert_eq!(m["container"]["id"], "c1");
         assert_eq!(m["usage"]["input_tokens"], 12);
         assert_eq!(m["usage"]["output_tokens"], 7);
-        assert_eq!(m["usage"]["cache_read_input_tokens"], 2, "null must not overwrite");
+        assert_eq!(
+            m["usage"]["cache_read_input_tokens"], 2,
+            "null must not overwrite"
+        );
         // key order of the base message is kept; new keys appended
         let keys: Vec<_> = m.as_object().unwrap().keys().cloned().collect();
         assert_eq!(
             keys,
-            ["id", "type", "role", "model", "content", "stop_reason", "stop_sequence", "usage", "container"]
+            [
+                "id",
+                "type",
+                "role",
+                "model",
+                "content",
+                "stop_reason",
+                "stop_sequence",
+                "usage",
+                "container"
+            ]
         );
     }
 
@@ -575,7 +605,10 @@ mod tests {
     #[test]
     fn partial_json_matches_sdk() {
         let cases = [
-            (r#"{"file_path":"/a","content":"lo"#, json!({"file_path":"/a"})),
+            (
+                r#"{"file_path":"/a","content":"lo"#,
+                json!({"file_path":"/a"}),
+            ),
             (r#"{"a":1"#, json!({"a":1})),
             (r#"{"a":[1,2"#, json!({"a":[1]})),
             (r#"{"a":1.5e"#, json!({})),
@@ -595,9 +628,17 @@ mod tests {
         let mut a = Aggregator::new();
         a.apply("message_start", &start()).unwrap();
         a.apply("content_block_start", &json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})).unwrap();
-        a.apply("message_delta", &json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}})).unwrap();
+        a.apply(
+            "message_delta",
+            &json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        )
+        .unwrap();
         assert!(!a.is_complete_without_stop(), "block 0 not stopped");
-        a.apply("content_block_stop", &json!({"type":"content_block_stop","index":0})).unwrap();
+        a.apply(
+            "content_block_stop",
+            &json!({"type":"content_block_stop","index":0}),
+        )
+        .unwrap();
         assert!(a.is_complete_without_stop());
     }
 

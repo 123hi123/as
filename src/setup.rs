@@ -190,14 +190,17 @@ pub fn health(port: u16, timeout: Duration) -> Result<Health, String> {
         .read_to_end(&mut buf)
         .map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&buf);
-    let (head, body) = text.split_once("\r\n\r\n").ok_or("malformed HTTP response")?;
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or("malformed HTTP response")?;
     if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
         return Err(format!(
             "unexpected response: {}",
             head.lines().next().unwrap_or("")
         ));
     }
-    let v: Value = serde_json::from_str(body.trim()).map_err(|_| "not an as-shim health response")?;
+    let v: Value =
+        serde_json::from_str(body.trim()).map_err(|_| "not an as-shim health response")?;
     if v.get("ok") != Some(&Value::Bool(true)) {
         return Err("not an as-shim health response".into());
     }
@@ -260,7 +263,10 @@ pub fn setup(opts: SetupOpts) -> Result<(), String> {
     let settings = ClaudeSettings::load(&settings_path);
     let cc_url = settings.as_ref().ok().and_then(|s| s.base_url());
 
-    say(format!("as-shim {} setup (anthropic to stream)", crate::VERSION));
+    say(format!(
+        "as-shim {} setup (anthropic to stream)",
+        crate::VERSION
+    ));
     say(format!("  config:          {}", cfg_path.display()));
     say(format!("  Claude settings: {}", settings_path.display()));
     if let Err(e) = &settings {
@@ -348,7 +354,9 @@ pub fn setup(opts: SetupOpts) -> Result<(), String> {
     }
 
     // 3) config
-    let mut cfg = existing.clone().unwrap_or_else(|| Config::new(upstream.clone()));
+    let mut cfg = existing
+        .clone()
+        .unwrap_or_else(|| Config::new(upstream.clone()));
     cfg.upstream = upstream.clone();
     cfg.listen = format!("127.0.0.1:{port}");
     cfg.validate()?;
@@ -360,13 +368,18 @@ pub fn setup(opts: SetupOpts) -> Result<(), String> {
     let service_note = if opts.no_service {
         format!(
             "not installed (--no-service); start it yourself: {} run",
-            current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "as-shim".into())
+            current_exe()
+                .map(|e| e.display().to_string())
+                .unwrap_or_else(|_| "as-shim".into())
         )
     } else if service::available() {
         let exe = current_exe()?;
         let unit = service::install(&exe, &cfg_path)?;
         service_running = true;
-        say(format!("  installed systemd user service {}", unit.display()));
+        say(format!(
+            "  installed systemd user service {}",
+            unit.display()
+        ));
         if service::linger_enabled() == Some(false) {
             say("  hint: the service runs while you are logged in. For cron/headless use run:");
             say("        loginctl enable-linger \"$USER\"");
@@ -385,7 +398,10 @@ pub fn setup(opts: SetupOpts) -> Result<(), String> {
     // 5) health
     let healthy = match wait_healthy(port, &upstream, if service_running { 8 } else { 1 }) {
         Ok(h) => {
-            say(format!("  health check ok (as-shim {} on 127.0.0.1:{port})", h.version));
+            say(format!(
+                "  health check ok (as-shim {} on 127.0.0.1:{port})",
+                h.version
+            ));
             true
         }
         Err(e) => {
@@ -418,7 +434,10 @@ pub fn setup(opts: SetupOpts) -> Result<(), String> {
                 } else if opts.yes {
                     default_yes
                 } else {
-                    p.confirm(&format!("Point Claude Code to the shim ({shim})?"), default_yes)
+                    p.confirm(
+                        &format!("Point Claude Code to the shim ({shim})?"),
+                        default_yes,
+                    )
                 };
                 if !go {
                     claude_note = format!(
@@ -431,10 +450,15 @@ pub fn setup(opts: SetupOpts) -> Result<(), String> {
                 } else {
                     let current = s.base_url();
                     let original = match &current {
-                        Some(u) if points_to_shim(u, port) || config::is_local_url(u) && cfg.original_claude_base_url.is_some() => cfg
-                            .original_claude_base_url
-                            .clone()
-                            .or_else(|| Some(upstream.clone())),
+                        Some(u)
+                            if points_to_shim(u, port)
+                                || config::is_local_url(u)
+                                    && cfg.original_claude_base_url.is_some() =>
+                        {
+                            cfg.original_claude_base_url
+                                .clone()
+                                .or_else(|| Some(upstream.clone()))
+                        }
                         Some(u) => Some(u.clone()),
                         None => Some(String::new()),
                     };
@@ -448,7 +472,8 @@ pub fn setup(opts: SetupOpts) -> Result<(), String> {
                     cfg.original_claude_base_url = original;
                     cfg.claude_settings_path = Some(s.path.to_string_lossy().into_owned());
                     cfg.save(&cfg_path)?;
-                    claude_note = format!("env.ANTHROPIC_BASE_URL = {shim} in {}", s.path.display());
+                    claude_note =
+                        format!("env.ANTHROPIC_BASE_URL = {shim} in {}", s.path.display());
                     say(format!("  Claude Code now uses {shim}"));
                     if let Some(e) = env_base_url().filter(|e| e != &shim) {
                         say(format!(
@@ -475,6 +500,9 @@ pub fn setup(opts: SetupOpts) -> Result<(), String> {
     say(format!("  upstream:     {upstream}"));
     say(format!("  listen:       127.0.0.1:{port}"));
     say(format!("  config:       {}", cfg_path.display()));
+    if let Some(p) = cfg.log_db_path() {
+        say(format!("  request log:  {} (SQLite)", p.display()));
+    }
     say(format!("  service:      {service_note}"));
     say(format!(
         "  health:       {}",
@@ -508,6 +536,25 @@ pub fn status() -> Result<(), String> {
     }
     println!("upstream:     {}", cfg.upstream);
     println!("listen:       {}", cfg.listen);
+    if cfg.resume {
+        println!(
+            "resume:       on (idle {}s, budget {}s; used when the server supports it)",
+            cfg.resume_idle_secs, cfg.resume_budget_secs
+        );
+    } else {
+        println!("resume:       off");
+    }
+    match cfg.log_db_path() {
+        Some(p) if cfg.log_retention_days == 0 => {
+            println!("request log:  {} (kept forever)", p.display())
+        }
+        Some(p) => println!(
+            "request log:  {} (kept {} days)",
+            p.display(),
+            cfg.log_retention_days
+        ),
+        None => println!("request log:  off"),
+    }
     println!(
         "service:      {}",
         if service::is_installed() {
@@ -582,7 +629,12 @@ pub fn set_upstream(url: &str) -> Result<(), String> {
 
 pub fn uninstall(yes: bool) -> Result<(), String> {
     let mut p = Prompter::new(yes);
-    if !yes && !p.confirm("Remove the as-shim service and config, and restore Claude Code settings?", true) {
+    if !yes
+        && !p.confirm(
+            "Remove the as-shim service and config, and restore Claude Code settings?",
+            true,
+        )
+    {
         return Err("aborted".into());
     }
     let cfg_path = config::default_config_path();
@@ -606,7 +658,9 @@ pub fn uninstall(yes: bool) -> Result<(), String> {
     match ClaudeSettings::load(&sp) {
         Ok(mut s) => match s.base_url() {
             Some(u) if points_to_shim(&u, port) => {
-                let original = cfg.as_ref().and_then(|c| c.original_claude_base_url.clone());
+                let original = cfg
+                    .as_ref()
+                    .and_then(|c| c.original_claude_base_url.clone());
                 match original.as_deref() {
                     Some("") => s.set_base_url(None),
                     Some(o) => s.set_base_url(Some(o)),
@@ -667,7 +721,9 @@ mod tests {
         assert_eq!(s.base_url().as_deref(), Some("https://gw.example"));
         s.set_base_url(Some("http://127.0.0.1:8787"));
         let backup = s.save().unwrap().unwrap();
-        assert!(std::fs::read_to_string(&backup).unwrap().contains("gw.example"));
+        assert!(std::fs::read_to_string(&backup)
+            .unwrap()
+            .contains("gw.example"));
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
         assert_eq!(keys, ["model", "env", "hooks"]);

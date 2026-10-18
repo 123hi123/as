@@ -27,6 +27,23 @@ fn d_max_body_mib() -> u64 {
 fn d_log_level() -> String {
     "info".to_string()
 }
+fn d_true() -> bool {
+    true
+}
+fn d_resume_idle_secs() -> u64 {
+    45
+}
+fn d_resume_budget_secs() -> u64 {
+    225
+}
+
+/// Claude Code abandons a stream after this long without a byte ("The response stopped
+/// arriving"); as-shim must give up resuming before that, so Claude Code sees the usual
+/// "Connection lost" and retries.
+pub const CLAUDE_CODE_STREAM_WATCHDOG_SECS: u64 = 300;
+fn d_log_retention_days() -> u64 {
+    30
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
@@ -53,6 +70,22 @@ pub struct Config {
     /// service and a foreground `run` behave the same).
     #[serde(default)]
     pub use_env_proxy: bool,
+    /// Resume a broken stream when the server advertises the as resume protocol v1.
+    #[serde(default = "d_true")]
+    pub resume: bool,
+    /// A resumable upstream that sends nothing for this long is treated as broken (0 = off).
+    #[serde(default = "d_resume_idle_secs")]
+    pub resume_idle_secs: u64,
+    /// Time to recover a break on top of `resume_idle_secs`: as-shim gives up once Claude Code
+    /// has gone `resume_idle_secs + resume_budget_secs` without a byte.
+    #[serde(default = "d_resume_budget_secs")]
+    pub resume_budget_secs: u64,
+    /// SQLite request log. Unset = `$XDG_STATE_HOME/as-shim/log.sqlite3`; "off" or "" disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_db: Option<String>,
+    /// Delete request log rows older than this many days (0 = keep forever).
+    #[serde(default = "d_log_retention_days")]
+    pub log_retention_days: u64,
     /// ANTHROPIC_BASE_URL that Claude Code used before `setup` pointed it at the shim.
     /// Empty string = the key was absent. Used by `uninstall` to restore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,6 +107,11 @@ impl Config {
             max_body_mib: d_max_body_mib(),
             log_level: d_log_level(),
             use_env_proxy: false,
+            resume: true,
+            resume_idle_secs: d_resume_idle_secs(),
+            resume_budget_secs: d_resume_budget_secs(),
+            log_db: None,
+            log_retention_days: d_log_retention_days(),
             original_claude_base_url: None,
             claude_settings_path: None,
         }
@@ -96,6 +134,11 @@ impl Config {
             "max_body_mib",
             "log_level",
             "use_env_proxy",
+            "resume",
+            "resume_idle_secs",
+            "resume_budget_secs",
+            "log_db",
+            "log_retention_days",
             "original_claude_base_url",
             "claude_settings_path",
         ];
@@ -157,9 +200,59 @@ impl Config {
         Ok(())
     }
 
+    /// Worst-case time Claude Code goes without a byte before as-shim gives up on a broken
+    /// resumable stream: `resume_idle_secs + resume_budget_secs`. `None` when idle detection
+    /// is off (a black-holed connection is then never detected).
+    pub fn resume_max_silence_secs(&self) -> Option<u64> {
+        (self.resume_idle_secs > 0).then(|| {
+            self.resume_idle_secs
+                .saturating_add(self.resume_budget_secs)
+        })
+    }
+
+    /// Startup warning when a broken stream could outlast Claude Code's own watchdog.
+    pub fn resume_watchdog_warning(&self) -> Option<String> {
+        let worst = self.resume_max_silence_secs().filter(|_| self.resume)?;
+        (worst >= CLAUDE_CODE_STREAM_WATCHDOG_SECS).then(|| {
+            format!(
+                "resume_idle_secs + resume_budget_secs = {worst} s: Claude Code may give up ({CLAUDE_CODE_STREAM_WATCHDOG_SECS} s without data) before resume does; keep the sum below {CLAUDE_CODE_STREAM_WATCHDOG_SECS} (default 45 + 225 = 270)"
+            )
+        })
+    }
+
     pub fn port(&self) -> Option<u16> {
         parse_listen(&self.listen).ok().map(|a| a.port())
     }
+
+    /// Where the SQLite request log lives; `None` when it is disabled.
+    pub fn log_db_path(&self) -> Option<PathBuf> {
+        match self.log_db.as_deref().map(str::trim) {
+            None => Some(default_log_db_path()),
+            Some("") => None,
+            Some(s) if s.eq_ignore_ascii_case("off") => None,
+            Some(s) => Some(expand_tilde(s)),
+        }
+    }
+}
+
+/// `~/x` -> `$HOME/x`.
+fn expand_tilde(s: &str) -> PathBuf {
+    match s.strip_prefix("~/") {
+        Some(rest) => home_dir().join(rest),
+        None => PathBuf::from(s),
+    }
+}
+
+/// `$XDG_STATE_HOME` or `~/.local/state`.
+pub fn xdg_state_home() -> PathBuf {
+    match std::env::var_os("XDG_STATE_HOME") {
+        Some(p) if !p.is_empty() && Path::new(&p).is_absolute() => PathBuf::from(p),
+        _ => home_dir().join(".local").join("state"),
+    }
+}
+
+pub fn default_log_db_path() -> PathBuf {
+    xdg_state_home().join("as-shim").join("log.sqlite3")
 }
 
 /// `listen` must be a loopback socket address.
@@ -183,7 +276,9 @@ pub fn normalize_upstream(s: &str) -> Result<String, String> {
         return Err("upstream URL is empty".into());
     }
     if t.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err(format!("upstream URL contains whitespace or control characters: {t:?}"));
+        return Err(format!(
+            "upstream URL contains whitespace or control characters: {t:?}"
+        ));
     }
     let url = reqwest::Url::parse(t).map_err(|e| format!("invalid URL {t:?}: {e}"))?;
     if !url.username().is_empty() || url.password().is_some() {
@@ -320,5 +415,60 @@ mod tests {
             Config::unknown_keys("upstream = \"https://x\"\nsilent_retry = 2\n"),
             vec!["silent_retry".to_string()]
         );
+    }
+
+    #[test]
+    fn old_config_gets_resume_and_log_defaults() {
+        // A v0.1 config file (no resume / log keys) must still load.
+        let old = "upstream = \"https://x.example\"\nlisten = \"127.0.0.1:8787\"\nsilent_retries = 1\nuse_env_proxy = false\n";
+        let c = Config::parse(old).unwrap();
+        assert!(c.resume);
+        assert_eq!(c.resume_idle_secs, 45);
+        assert_eq!(c.resume_budget_secs, 225);
+        assert_eq!(c.log_db, None);
+        assert_eq!(c.log_retention_days, 30);
+        assert!(Config::unknown_keys(old).is_empty());
+        let text = c.to_toml();
+        assert!(text.contains("resume = true"), "{text}");
+        assert!(text.contains("log_retention_days = 30"), "{text}");
+        assert!(!text.contains("log_db"), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn resume_worst_case_silence_stays_below_the_watchdog() {
+        let mut c = Config::new("https://x.example".into());
+        assert_eq!(c.resume_max_silence_secs(), Some(270));
+        assert!(c.resume_max_silence_secs().unwrap() < CLAUDE_CODE_STREAM_WATCHDOG_SECS);
+        assert_eq!(c.resume_watchdog_warning(), None);
+        c.resume_budget_secs = 254;
+        assert_eq!(c.resume_watchdog_warning(), None, "299 s is still in time");
+        c.resume_budget_secs = 255;
+        assert!(c.resume_watchdog_warning().unwrap().contains("= 300 s"));
+        c.resume = false;
+        assert_eq!(c.resume_watchdog_warning(), None);
+        c.resume = true;
+        c.resume_idle_secs = 0;
+        assert_eq!(c.resume_max_silence_secs(), None);
+        c.resume_idle_secs = u64::MAX;
+        assert_eq!(c.resume_max_silence_secs(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn log_db_path_rules() {
+        let mut c = Config::new("https://x.example".into());
+        assert!(c.log_db_path().unwrap().ends_with("as-shim/log.sqlite3"));
+        c.log_db = Some("off".into());
+        assert_eq!(c.log_db_path(), None);
+        c.log_db = Some(String::new());
+        assert_eq!(c.log_db_path(), None);
+        c.log_db = Some("/var/tmp/x.sqlite3".into());
+        assert_eq!(c.log_db_path(), Some(PathBuf::from("/var/tmp/x.sqlite3")));
+        let mut new = Config::parse("upstream = \"https://x\"\nresume = false\nresume_idle_secs = 5\nlog_db = \"/tmp/l.db\"\nlog_retention_days = 0\n").unwrap();
+        assert!(!new.resume);
+        assert_eq!(new.resume_idle_secs, 5);
+        assert_eq!(new.log_retention_days, 0);
+        new.log_db = None;
+        assert!(new.log_db_path().is_some());
     }
 }

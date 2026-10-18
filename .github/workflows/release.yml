@@ -24,6 +24,10 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
       - name: Build
+        env:
+          # rusqlite's bundled SQLite is C code: compile it against musl (static), not glibc.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Package
         run: |

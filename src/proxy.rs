@@ -6,24 +6,28 @@
 //! * PATH N (no `stream: true`): send the request upstream as a stream (so the gateway keeps
 //!   the Cloudflare connection busy with pings) and rebuild the non-stream Message JSON.
 //! * Everything else is a transparent passthrough.
+//!
+//! When the upstream implements the as resume protocol v1, a broken SSE body is healed by
+//! [`crate::resume::UpstreamBody`] before any of the logic here sees it.
 
 use crate::aggregate::{is_content_event, Aggregator, Step};
 use crate::config::Config;
 use crate::errmap;
+use crate::logdb::{LogSink, RequestRow, ResumeEventRow};
+use crate::resume::{PendingAttempt, UpstreamBody, RESUME_ID_HEADER};
 use crate::sse::{Frame, SseParser};
 use crate::{log_info, log_warn};
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use bytes::{Bytes, BytesMut};
-use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::future::Future;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A single SSE frame larger than this is treated as a broken stream.
@@ -42,12 +46,21 @@ const BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
 pub const CF_524_MESSAGE: &str = "Cloudflare 524 upstream timeout — the request may still be running upstream; not retried locally";
 
 pub struct AppState {
-    upstream: String,
-    client: reqwest::Client,
+    pub(crate) upstream: String,
+    pub(crate) client: reqwest::Client,
+    /// Same settings as `client`, but never reuses a connection: used for resume GETs and
+    /// ack/cancel DELETEs, which often follow a break that also killed the pooled connections.
+    pub(crate) fresh_client: reqwest::Client,
     max_body: usize,
     silent_retries: u32,
     retry_window: Duration,
     retry_delay: Duration,
+    /// Opt in to the as resume protocol (send `X-AS-Resume-Id`, heal broken streams).
+    pub(crate) resume: bool,
+    /// Silence on a resumable upstream that counts as a break (None = never).
+    pub(crate) resume_idle: Option<Duration>,
+    pub(crate) resume_budget: Duration,
+    log_sink: Option<LogSink>,
     epoch: Instant,
     breaker_failures: AtomicU32,
     breaker_last_ms: AtomicU64,
@@ -56,25 +69,35 @@ pub struct AppState {
 impl AppState {
     pub fn new(cfg: &Config) -> Result<Self, String> {
         let upstream = crate::config::normalize_upstream(&cfg.upstream)?;
-        let mut builder = reqwest::Client::builder();
-        if !cfg.use_env_proxy {
-            builder = builder.no_proxy();
-        }
-        let client = builder
-            .connect_timeout(Duration::from_secs(cfg.connect_timeout_secs.max(1)))
-            .redirect(reqwest::redirect::Policy::none())
-            .tcp_keepalive(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(60))
-            .http1_only()
-            .build()
-            .map_err(|e| format!("cannot build HTTP client: {e}"))?;
+        let builder = || {
+            let mut b = reqwest::Client::builder();
+            if !cfg.use_env_proxy {
+                b = b.no_proxy();
+            }
+            b.connect_timeout(Duration::from_secs(cfg.connect_timeout_secs.max(1)))
+                .redirect(reqwest::redirect::Policy::none())
+                .tcp_keepalive(Duration::from_secs(30))
+                .http1_only()
+        };
+        let build = |b: reqwest::ClientBuilder| {
+            b.build()
+                .map_err(|e| format!("cannot build HTTP client: {e}"))
+        };
+        let client = build(builder().pool_idle_timeout(Duration::from_secs(60)))?;
+        let fresh_client = build(builder().pool_max_idle_per_host(0))?;
         Ok(AppState {
             upstream,
             client,
+            fresh_client,
             max_body: (cfg.max_body_mib.max(1) as usize).saturating_mul(1 << 20),
             silent_retries: cfg.silent_retries,
             retry_window: Duration::from_secs(cfg.silent_retry_max_elapsed_secs),
             retry_delay: Duration::from_millis(cfg.silent_retry_delay_ms),
+            resume: cfg.resume,
+            resume_idle: (cfg.resume_idle_secs > 0)
+                .then(|| Duration::from_secs(cfg.resume_idle_secs)),
+            resume_budget: Duration::from_secs(cfg.resume_budget_secs),
+            log_sink: None,
             epoch: Instant::now(),
             breaker_failures: AtomicU32::new(0),
             breaker_last_ms: AtomicU64::new(0),
@@ -125,9 +148,56 @@ impl AppState {
             .await
             .map_err(|e| describe_reqwest_error(&e))
     }
+
+    /// Send a `/v1/messages` request that expects an SSE answer. With resume on, every call
+    /// carries a fresh `X-AS-Resume-Id`, which is returned alongside the response.
+    async fn send_messages(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+    ) -> Result<(reqwest::Response, Option<String>), String> {
+        let id = if self.resume {
+            crate::resume::new_resume_id()
+        } else {
+            None
+        };
+        let mut rb = self
+            .client
+            .request(method.clone(), url)
+            .headers(headers.clone());
+        if let Some(id) = &id {
+            rb = rb.header(RESUME_ID_HEADER, id.as_str());
+        }
+        // If Claude Code goes away while the headers are pending, this future is dropped here:
+        // the guard then cancels the attempt the server may already be generating.
+        let pending = id
+            .as_deref()
+            .map(|id| PendingAttempt::new(self, id, headers));
+        let res = rb.body(body).send().await;
+        // Answered (the response's ack/cancel takes over) or failed (handled below).
+        if let Some(p) = pending {
+            p.settle();
+        }
+        match res {
+            Ok(r) => Ok((r, id)),
+            Err(e) => {
+                // Failed before response headers. Unless the connection was never made, the
+                // server may have admitted this attempt and be generating: cancel it so the
+                // re-send does not leave a second, orphaned generation running.
+                if let Some(id) = &id {
+                    if !e.is_connect() {
+                        crate::resume::cancel_unanswered(self, id, headers, "request failed");
+                    }
+                }
+                Err(describe_reqwest_error(&e))
+            }
+        }
+    }
 }
 
-fn describe_reqwest_error(e: &reqwest::Error) -> String {
+pub(crate) fn describe_reqwest_error(e: &reqwest::Error) -> String {
     let kind = if e.is_connect() {
         "connect error"
     } else if e.is_timeout() {
@@ -160,64 +230,231 @@ impl WithoutUrlRef for reqwest::Error {
     }
 }
 
+/// The proxy router, logging requests to the SQLite file configured in `cfg` (if any).
 pub fn app(cfg: &Config) -> Result<Router, String> {
-    let st = Arc::new(AppState::new(cfg)?);
-    Ok(Router::new().fallback(handle).with_state(st))
+    let sink = start_log(cfg);
+    app_with_log(cfg, sink)
 }
 
-/// Serve until `shutdown` resolves.
-pub async fn serve<F>(listener: tokio::net::TcpListener, cfg: &Config, shutdown: F) -> std::io::Result<()>
+fn start_log(cfg: &Config) -> Option<LogSink> {
+    cfg.log_db_path()
+        .map(|p| crate::logdb::start(p, cfg.log_retention_days))
+}
+
+fn app_with_log(cfg: &Config, sink: Option<LogSink>) -> Result<Router, String> {
+    let mut st = AppState::new(cfg)?;
+    st.log_sink = sink;
+    Ok(Router::new().fallback(handle).with_state(Arc::new(st)))
+}
+
+/// Serve until `shutdown` resolves, then flush the request log.
+pub async fn serve<F>(
+    listener: tokio::net::TcpListener,
+    cfg: &Config,
+    shutdown: F,
+) -> std::io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let app = app(cfg).map_err(std::io::Error::other)?;
-    axum::serve(listener, app).with_graceful_shutdown(shutdown).await
+    let sink = start_log(cfg);
+    let app = app_with_log(cfg, sink.clone()).map_err(std::io::Error::other)?;
+    let r = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await;
+    if let Some(s) = sink {
+        let _ = tokio::task::spawn_blocking(move || s.flush(Duration::from_secs(5))).await;
+    }
+    r
 }
 
 // ------------------------------------------------------------------------------ logging
 
-/// One log line per request, written when the request (including a streamed body) ends.
-struct ReqLog {
+/// Per-request record, shared by the handler, the response body and the upstream body.
+/// When the last handle is dropped (the response is done or Claude Code went away), one line
+/// goes to stderr and one row to the SQLite log.
+#[derive(Clone)]
+pub(crate) struct ReqLog {
+    rec: Arc<Mutex<Record>>,
+    started: Instant,
+}
+
+pub(crate) struct Record {
     method: Method,
     path: String,
     started: Instant,
+    ts_start_ms: i64,
     mode: &'static str,
     status: u16,
     retries: u32,
     outcome: String,
+    model: Option<String>,
+    client_stream: Option<bool>,
+    upstream_status: Option<u16>,
+    upstream_request_id: Option<String>,
+    ttfb: Option<Duration>,
+    bytes_out: u64,
+    pub(crate) resume_id: Option<String>,
+    pub(crate) resume_attempts: u32,
+    pub(crate) resume_recovered: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) events: Vec<ResumeEventRow>,
+    sink: Option<LogSink>,
 }
 
 impl ReqLog {
-    fn new(method: Method, path: String) -> Self {
+    fn new(method: Method, path: String, sink: Option<LogSink>) -> Self {
+        let started = Instant::now();
         ReqLog {
-            method,
-            path,
-            started: Instant::now(),
-            mode: "passthrough",
-            status: 0,
-            retries: 0,
-            outcome: "client_closed".into(),
+            rec: Arc::new(Mutex::new(Record {
+                method,
+                path,
+                started,
+                ts_start_ms: crate::util::unix_ms(),
+                mode: "passthrough",
+                status: 0,
+                retries: 0,
+                outcome: "client_closed".into(),
+                model: None,
+                client_stream: None,
+                upstream_status: None,
+                upstream_request_id: None,
+                ttfb: None,
+                bytes_out: 0,
+                resume_id: None,
+                resume_attempts: 0,
+                resume_recovered: false,
+                error: None,
+                events: Vec::new(),
+                sink,
+            })),
+            started,
         }
     }
-    fn set(&mut self, status: u16, outcome: impl Into<String>) {
-        self.status = status;
-        self.outcome = outcome.into();
+
+    pub(crate) fn update<R>(&self, f: impl FnOnce(&mut Record) -> R) -> R {
+        let mut g = self.rec.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut g)
+    }
+
+    fn started(&self) -> Instant {
+        self.started
+    }
+
+    fn set(&self, status: u16, outcome: impl Into<String>) {
+        let outcome = outcome.into();
+        self.update(|r| {
+            r.status = status;
+            r.outcome = outcome;
+        });
+    }
+
+    fn outcome(&self, outcome: impl Into<String>) {
+        let outcome = outcome.into();
+        self.update(|r| r.outcome = outcome);
+    }
+
+    fn error(&self, msg: &str) {
+        let msg = errmap::truncate(msg, 300);
+        self.update(|r| r.error = Some(msg));
+    }
+
+    fn mode(&self, mode: &'static str) {
+        self.update(|r| r.mode = mode);
+    }
+
+    fn retries(&self, n: u32) {
+        self.update(|r| r.retries = n);
+    }
+
+    /// Remember the upstream status and request id of the latest upstream response.
+    fn upstream(&self, resp: &reqwest::Response) {
+        let status = resp.status().as_u16();
+        let rid = resp
+            .headers()
+            .get("request-id")
+            .or_else(|| resp.headers().get("x-request-id"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| errmap::truncate(s, 200));
+        self.update(|r| {
+            r.upstream_status = Some(status);
+            r.upstream_request_id = rid;
+        });
     }
 }
 
-impl Drop for ReqLog {
+impl Drop for Record {
     fn drop(&mut self) {
+        let dur = self.started.elapsed();
+        let resumes = if self.resume_attempts > 0 {
+            format!(
+                " resumes={} recovered={}",
+                self.resume_attempts, self.resume_recovered
+            )
+        } else {
+            String::new()
+        };
         log_info!(
-            "{} {} mode={} status={} dur={}ms retries={} outcome={}",
+            "{} {} mode={} status={} dur={}ms retries={} outcome={}{resumes}",
             self.method,
             self.path,
             self.mode,
             self.status,
-            self.started.elapsed().as_millis(),
+            dur.as_millis(),
             self.retries,
             self.outcome
         );
+        let Some(sink) = self.sink.take() else {
+            return;
+        };
+        let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
+        sink.send(RequestRow {
+            ts_start_ms: self.ts_start_ms,
+            ts_end_ms: self.ts_start_ms.saturating_add(ms(dur)),
+            method: self.method.to_string(),
+            path: std::mem::take(&mut self.path),
+            model: self.model.take(),
+            client_stream: self.client_stream,
+            mode: self.mode.to_string(),
+            status: (self.status != 0).then_some(self.status),
+            upstream_status: self.upstream_status,
+            duration_ms: ms(dur),
+            ttfb_ms: self.ttfb.map(ms),
+            bytes_out: self.bytes_out,
+            outcome: std::mem::take(&mut self.outcome),
+            silent_retries: self.retries,
+            resume_id: self.resume_id.take(),
+            resume_attempts: self.resume_attempts,
+            resume_recovered: self.resume_recovered,
+            upstream_request_id: self.upstream_request_id.take(),
+            error: self.error.take(),
+            events: std::mem::take(&mut self.events),
+        });
     }
+}
+
+/// Count the bytes sent to Claude Code and the time to the first one. The log record lives
+/// as long as the response body.
+fn track(resp: Response, log: ReqLog) -> Response {
+    let (parts, body) = resp.into_parts();
+    if let Some(n) = body.size_hint().exact() {
+        log.update(|r| {
+            r.bytes_out = n;
+            r.ttfb = Some(r.started.elapsed());
+        });
+        return Response::from_parts(parts, body);
+    }
+    let stream = body.into_data_stream().map(move |item| {
+        if let Ok(b) = &item {
+            if !b.is_empty() {
+                log.update(|r| {
+                    r.ttfb.get_or_insert_with(|| r.started.elapsed());
+                    r.bytes_out += b.len() as u64;
+                });
+            }
+        }
+        item
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 // ------------------------------------------------------------------------------ helpers
@@ -225,7 +462,13 @@ impl Drop for ReqLog {
 fn is_hop_by_hop(name: &str) -> bool {
     matches!(
         name,
-        "connection" | "keep-alive" | "te" | "trailer" | "trailers" | "transfer-encoding" | "upgrade"
+        "connection"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "trailers"
+            | "transfer-encoding"
+            | "upgrade"
     ) || name.starts_with("proxy-")
 }
 
@@ -263,7 +506,10 @@ fn messages_upstream_headers(src: &HeaderMap) -> HeaderMap {
             header::ACCEPT_ENCODING,
         ],
     );
-    h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    h.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
     h
 }
 
@@ -271,13 +517,13 @@ fn header_str<'a>(h: &'a HeaderMap, name: &HeaderName) -> &'a str {
     h.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
-fn is_sse(h: &HeaderMap) -> bool {
+pub(crate) fn is_sse(h: &HeaderMap) -> bool {
     header_str(h, &header::CONTENT_TYPE)
         .to_ascii_lowercase()
         .starts_with("text/event-stream")
 }
 
-fn is_encoded(h: &HeaderMap) -> bool {
+pub(crate) fn is_encoded(h: &HeaderMap) -> bool {
     let ce = header_str(h, &header::CONTENT_ENCODING).trim();
     !ce.is_empty() && !ce.eq_ignore_ascii_case("identity")
 }
@@ -338,14 +584,22 @@ fn status_code(s: u16) -> StatusCode {
 fn json_response(status: u16, mut headers: HeaderMap, body: Vec<u8>) -> Response {
     headers.remove(header::CONTENT_LENGTH);
     headers.remove(header::CONTENT_ENCODING);
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
     let mut r = Response::new(Body::from(body));
     *r.status_mut() = status_code(status);
     *r.headers_mut() = headers;
     r
 }
 
-fn error_response(status: u16, error_type: &str, message: &str, request_id: Option<&str>) -> Response {
+fn error_response(
+    status: u16,
+    error_type: &str,
+    message: &str,
+    request_id: Option<&str>,
+) -> Response {
     json_response(
         status,
         HeaderMap::new(),
@@ -373,33 +627,41 @@ async fn read_limited(resp: reqwest::Response, limit: usize) -> Bytes {
 }
 
 /// Stream an upstream response back unchanged.
-fn stream_through(resp: reqwest::Response, mut log: ReqLog, outcome: &'static str) -> Response {
+fn stream_through(resp: reqwest::Response, log: &ReqLog, outcome: &'static str) -> Response {
     let status = resp.status().as_u16();
     let headers = filter_headers(resp.headers(), &[]);
     // hyper stops polling once `content-length` bytes are written, so count them ourselves.
     let mut remaining = resp.content_length();
-    log.set(status, if remaining == Some(0) { outcome } else { "client_closed" });
+    log.set(
+        status,
+        if remaining == Some(0) {
+            outcome
+        } else {
+            "client_closed"
+        },
+    );
     let body = futures_util::stream::unfold(
-        (resp.bytes_stream().boxed(), Some(log)),
-        move |(mut s, mut log)| async move {
-            let l = log.as_mut()?;
+        (resp.bytes_stream().boxed(), Some(log.clone())),
+        move |(mut s, log)| async move {
+            let l = log.as_ref()?;
             match s.next().await {
                 Some(Ok(b)) => {
                     if let Some(r) = remaining.as_mut() {
                         *r = r.saturating_sub(b.len() as u64);
                         if *r == 0 {
-                            l.outcome = outcome.into();
+                            l.outcome(outcome);
                         }
                     }
                     Some((Ok(b), (s, log)))
                 }
                 Some(Err(e)) => {
-                    l.outcome = "upstream_io_error".into();
-                    let err = std::io::Error::other(describe_reqwest_error(&e));
-                    Some((Err(err), (s, None)))
+                    let msg = describe_reqwest_error(&e);
+                    l.outcome("upstream_io_error");
+                    l.error(&msg);
+                    Some((Err(std::io::Error::other(msg)), (s, None)))
                 }
                 None => {
-                    l.outcome = outcome.into();
+                    l.outcome(outcome);
                     None
                 }
             }
@@ -413,7 +675,7 @@ fn stream_through(resp: reqwest::Response, mut log: ReqLog, outcome: &'static st
 
 /// Non-2xx upstream response: pass through, except Cloudflare HTML error pages, which are
 /// turned into Anthropic-style JSON (524 becomes a non-retried 529).
-async fn upstream_error_response(resp: reqwest::Response, mut log: ReqLog) -> Response {
+async fn upstream_error_response(resp: reqwest::Response, log: &ReqLog) -> Response {
     let status = resp.status().as_u16();
     let ct = header_str(resp.headers(), &header::CONTENT_TYPE).to_ascii_lowercase();
     let html = ct.contains("text/html");
@@ -449,6 +711,7 @@ async fn upstream_error_response(resp: reqwest::Response, mut log: ReqLog) -> Re
         "upstream returned HTTP {status}: {}",
         errmap::body_message(&body)
     );
+    log.error(&msg);
     json_response(status, headers, errmap::error_json("api_error", &msg, None))
 }
 
@@ -458,27 +721,31 @@ async fn handle(State(st): State<Arc<AppState>>, req: Request) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     if !request_is_local(req.headers()) {
-        let mut log = ReqLog::new(method, path);
+        let log = ReqLog::new(method, path, st.log_sink.clone());
         log.set(403, "rejected_non_local_host");
-        return error_response(
+        let resp = error_response(
             403,
             "permission_error",
             "as-shim only accepts requests addressed to 127.0.0.1/localhost",
             None,
         );
+        return track(resp, log);
     }
     if path == "/__as/health" && (method == Method::GET || method == Method::HEAD) {
-        let body = serde_json::json!({"ok": true, "version": crate::VERSION, "upstream": st.upstream});
+        let body =
+            serde_json::json!({"ok": true, "version": crate::VERSION, "upstream": st.upstream});
         return json_response(200, HeaderMap::new(), body.to_string().into_bytes());
     }
-    let log = ReqLog::new(method.clone(), path.clone());
-    if method == Method::POST && path == "/v1/messages" {
-        return messages(st, req, log).await;
-    }
-    passthrough(st, req, log).await
+    let log = ReqLog::new(method.clone(), path.clone(), st.log_sink.clone());
+    let resp = if method == Method::POST && path == "/v1/messages" {
+        messages(st, req, &log).await
+    } else {
+        passthrough(st, req, &log).await
+    };
+    track(resp, log)
 }
 
-async fn passthrough(st: Arc<AppState>, req: Request, mut log: ReqLog) -> Response {
+async fn passthrough(st: Arc<AppState>, req: Request, log: &ReqLog) -> Response {
     let (parts, body) = req.into_parts();
     let declared_len = header_str(&parts.headers, &header::CONTENT_LENGTH)
         .parse::<u64>()
@@ -496,7 +763,10 @@ async fn passthrough(st: Arc<AppState>, req: Request, mut log: ReqLog) -> Respon
         || parts.headers.contains_key(header::TRANSFER_ENCODING);
     let headers = filter_headers(&parts.headers, &[header::HOST, header::EXPECT]);
     let url = st.url(&parts.uri);
-    let mut rb = st.client.request(parts.method.clone(), &url).headers(headers);
+    let mut rb = st
+        .client
+        .request(parts.method.clone(), &url)
+        .headers(headers);
     if has_body {
         let max = st.max_body;
         let mut seen = 0usize;
@@ -514,17 +784,29 @@ async fn passthrough(st: Arc<AppState>, req: Request, mut log: ReqLog) -> Respon
         rb = rb.body(reqwest::Body::wrap_stream(limited));
     }
     match rb.send().await {
-        Ok(resp) if resp.status().is_success() => stream_through(resp, log, "ok"),
-        Ok(resp) => upstream_error_response(resp, log).await,
+        Ok(resp) => {
+            log.upstream(&resp);
+            if resp.status().is_success() {
+                stream_through(resp, log, "ok")
+            } else {
+                upstream_error_response(resp, log).await
+            }
+        }
         Err(e) => {
             let msg = describe_reqwest_error(&e);
             log.set(502, "upstream_request_failed");
-            error_response(502, "api_error", &format!("as-shim: upstream request failed: {msg}"), None)
+            log.error(&msg);
+            error_response(
+                502,
+                "api_error",
+                &format!("as-shim: upstream request failed: {msg}"),
+                None,
+            )
         }
     }
 }
 
-async fn messages(st: Arc<AppState>, req: Request, mut log: ReqLog) -> Response {
+async fn messages(st: Arc<AppState>, req: Request, log: &ReqLog) -> Response {
     let (parts, body) = req.into_parts();
     let bytes = match axum::body::to_bytes(body, st.max_body).await {
         Ok(b) => b,
@@ -541,7 +823,12 @@ async fn messages(st: Arc<AppState>, req: Request, mut log: ReqLog) -> Response 
                 );
             }
             log.set(400, "client_body_error");
-            return error_response(400, "invalid_request_error", "as-shim: could not read request body", None);
+            return error_response(
+                400,
+                "invalid_request_error",
+                "as-shim: could not read request body",
+                None,
+            );
         }
     };
     let headers = messages_upstream_headers(&parts.headers);
@@ -549,26 +836,115 @@ async fn messages(st: Arc<AppState>, req: Request, mut log: ReqLog) -> Response 
     let obj = match serde_json::from_slice::<Value>(&bytes) {
         Ok(Value::Object(m)) => m,
         _ => {
-            log.mode = "passthrough";
+            log.mode("passthrough");
             return match st.send(&parts.method, &url, &headers, bytes).await {
-                Ok(resp) if resp.status().is_success() => stream_through(resp, log, "ok"),
-                Ok(resp) => upstream_error_response(resp, log).await,
+                Ok(resp) => {
+                    log.upstream(&resp);
+                    if resp.status().is_success() {
+                        stream_through(resp, log, "ok")
+                    } else {
+                        upstream_error_response(resp, log).await
+                    }
+                }
                 Err(msg) => {
                     log.set(502, "upstream_request_failed");
-                    error_response(502, "api_error", &format!("as-shim: upstream request failed: {msg}"), None)
+                    log.error(&msg);
+                    error_response(
+                        502,
+                        "api_error",
+                        &format!("as-shim: upstream request failed: {msg}"),
+                        None,
+                    )
                 }
             };
         }
     };
-    if obj.get("stream") == Some(&Value::Bool(true)) {
-        log.mode = "S";
-        path_s(st, parts.method, url, headers, bytes, log).await
+    let stream = obj.get("stream") == Some(&Value::Bool(true));
+    let model = obj
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|m| errmap::truncate(m, 200));
+    log.update(|r| {
+        r.model = model;
+        r.client_stream = Some(stream);
+    });
+    let method = parts.method;
+    if stream {
+        log.mode("S");
+        let req = UpReq {
+            method,
+            url,
+            headers,
+            body: bytes,
+        };
+        path_s(st, req, log).await
     } else {
-        log.mode = "N";
+        log.mode("N");
         let mut obj = obj;
         obj.insert("stream".into(), Value::Bool(true));
         let body = Bytes::from(serde_json::to_vec(&Value::Object(obj)).unwrap_or_default());
-        path_n(st, parts.method, url, headers, body, log).await
+        path_n(
+            st,
+            UpReq {
+                method,
+                url,
+                headers,
+                body,
+            },
+            log,
+        )
+        .await
+    }
+}
+
+/// A `/v1/messages` request as it is (re-)sent upstream.
+struct UpReq {
+    method: Method,
+    url: String,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+/// Send a messages request upstream, silently re-sending connect failures and resume-id
+/// conflicts (409) while that is allowed. Err = the response to give Claude Code.
+async fn send_with_retries(
+    st: &AppState,
+    which: &str,
+    req: &UpReq,
+    retries: &mut u32,
+    log: &ReqLog,
+) -> Result<(reqwest::Response, Option<String>), Box<Response>> {
+    loop {
+        let msg = match st
+            .send_messages(&req.method, &req.url, &req.headers, req.body.clone())
+            .await
+        {
+            Ok((resp, id)) if resp.status() == StatusCode::CONFLICT && id.is_some() => {
+                // The server already knows this resume id: nothing was generated, re-send.
+                if !st.pre_content_failure(*retries, log.started()) {
+                    return Ok((resp, id));
+                }
+                "resume id conflict (HTTP 409)".to_string()
+            }
+            Ok(x) => return Ok(x),
+            Err(msg) => {
+                if !st.pre_content_failure(*retries, log.started()) {
+                    log.set(529, "upstream_request_failed");
+                    log.error(&msg);
+                    return Err(Box::new(error_response(
+                        529,
+                        "overloaded_error",
+                        &format!("as-shim: upstream request failed: {msg}"),
+                        None,
+                    )));
+                }
+                msg
+            }
+        };
+        *retries += 1;
+        log.retries(*retries);
+        log_info!("PATH {which}: upstream request failed ({msg}); silent retry {retries}");
+        tokio::time::sleep(st.retry_delay).await;
     }
 }
 
@@ -610,7 +986,9 @@ impl Failure {
             Failure::Eof => "stream ended early".into(),
             Failure::Io(e) => format!("stream I/O error ({e})"),
             Failure::Frame {
-                error_type, message, ..
+                error_type,
+                message,
+                ..
             } => format!("error frame {error_type}: {message}"),
             Failure::Malformed(e) => format!("malformed stream ({e})"),
         }
@@ -621,7 +999,10 @@ impl Failure {
             Failure::Eof => "eof".into(),
             Failure::Io(_) => "io_error".into(),
             Failure::Frame { error_type, .. } => {
-                format!("error_frame:{}", errmap::truncate(error_type, 64).replace(' ', "_"))
+                format!(
+                    "error_frame:{}",
+                    errmap::truncate(error_type, 64).replace(' ', "_")
+                )
             }
             Failure::Malformed(_) => "malformed_stream".into(),
         }
@@ -630,35 +1011,14 @@ impl Failure {
 
 // ------------------------------------------------------------------------------ PATH N
 
-async fn path_n(
-    st: Arc<AppState>,
-    method: Method,
-    url: String,
-    headers: HeaderMap,
-    body: Bytes,
-    mut log: ReqLog,
-) -> Response {
+async fn path_n(st: Arc<AppState>, req: UpReq, log: &ReqLog) -> Response {
     let mut retries = 0u32;
     loop {
-        let resp = match st.send(&method, &url, &headers, body.clone()).await {
-            Ok(r) => r,
-            Err(msg) => {
-                if st.pre_content_failure(retries, log.started) {
-                    retries += 1;
-                    log.retries = retries;
-                    log_info!("PATH N: upstream request failed ({msg}); silent retry {retries}");
-                    tokio::time::sleep(st.retry_delay).await;
-                    continue;
-                }
-                log.set(529, "upstream_request_failed");
-                return error_response(
-                    529,
-                    "overloaded_error",
-                    &format!("as-shim: upstream request failed: {msg}"),
-                    None,
-                );
-            }
+        let (resp, id) = match send_with_retries(&st, "N", &req, &mut retries, log).await {
+            Ok(x) => x,
+            Err(r) => return *r,
         };
+        log.upstream(&resp);
         if !resp.status().is_success() {
             return upstream_error_response(resp, log).await;
         }
@@ -667,7 +1027,11 @@ async fn path_n(
         }
         let status = resp.status().as_u16();
         let resp_headers = resp.headers().clone();
-        match aggregate(&st, resp).await {
+        let mut up = UpstreamBody::new(&st, resp, id, &req.headers, log);
+        let result = aggregate(&st, &mut up).await;
+        // Drop now so the ack / cancel goes out before a possible re-send.
+        drop(up);
+        match result {
             Ok(msg) => {
                 let mut h = filter_headers(&resp_headers, &[header::CONTENT_TYPE]);
                 h.remove(header::CONTENT_LENGTH);
@@ -677,10 +1041,10 @@ async fn path_n(
             Err((failure, content_started)) => {
                 if !content_started
                     && failure.is_transient()
-                    && st.pre_content_failure(retries, log.started)
+                    && st.pre_content_failure(retries, log.started())
                 {
                     retries += 1;
-                    log.retries = retries;
+                    log.retries(retries);
                     log_info!(
                         "PATH N: {} before content; silent retry {retries}",
                         failure.outcome()
@@ -694,7 +1058,12 @@ async fn path_n(
     }
 }
 
-fn path_n_error(failure: Failure, upstream_headers: &HeaderMap, retries: u32, mut log: ReqLog) -> Response {
+fn path_n_error(
+    failure: Failure,
+    upstream_headers: &HeaderMap,
+    retries: u32,
+    log: &ReqLog,
+) -> Response {
     let outcome = failure.outcome();
     let rid = request_id(upstream_headers);
     let attempts = retries + 1;
@@ -739,6 +1108,7 @@ fn path_n_error(failure: Failure, upstream_headers: &HeaderMap, retries: u32, mu
         }
     }
     log.set(status, outcome);
+    log.error(&msg);
     json_response(status, h, errmap::error_json(&ty, &msg, rid.as_deref()))
 }
 
@@ -767,10 +1137,9 @@ fn aggregate_frame(agg: &mut Aggregator, frame: Frame) -> Result<Handled, Failur
 }
 
 /// Read an SSE response into a non-stream Message. Err carries whether content had started.
-async fn aggregate(st: &AppState, resp: reqwest::Response) -> Result<Value, (Failure, bool)> {
+async fn aggregate(st: &AppState, body: &mut UpstreamBody) -> Result<Value, (Failure, bool)> {
     let mut parser = SseParser::new();
     let mut agg = Aggregator::new();
-    let mut stream = resp.bytes_stream();
     let mut total = 0usize;
     let mut reported = false;
     loop {
@@ -793,7 +1162,7 @@ async fn aggregate(st: &AppState, resp: reqwest::Response) -> Result<Value, (Fai
             let started = agg.content_started();
             return Err((Failure::Io("SSE frame too large".into()), started));
         }
-        match stream.next().await {
+        match body.next().await {
             Some(Ok(chunk)) => {
                 total += chunk.len();
                 if total > MAX_AGGREGATE_BYTES {
@@ -807,7 +1176,7 @@ async fn aggregate(st: &AppState, resp: reqwest::Response) -> Result<Value, (Fai
             }
             Some(Err(e)) => {
                 let started = agg.content_started();
-                return Err((Failure::Io(describe_reqwest_error(&e)), started));
+                return Err((Failure::Io(e), started));
             }
             None => {
                 parser.set_eof();
@@ -839,36 +1208,13 @@ async fn aggregate(st: &AppState, resp: reqwest::Response) -> Result<Value, (Fai
 
 // ------------------------------------------------------------------------------ PATH S
 
-async fn path_s(
-    st: Arc<AppState>,
-    method: Method,
-    url: String,
-    headers: HeaderMap,
-    body: Bytes,
-    mut log: ReqLog,
-) -> Response {
+async fn path_s(st: Arc<AppState>, req: UpReq, log: &ReqLog) -> Response {
     let mut retries = 0u32;
-    let resp = loop {
-        match st.send(&method, &url, &headers, body.clone()).await {
-            Ok(r) => break r,
-            Err(msg) => {
-                if st.pre_content_failure(retries, log.started) {
-                    retries += 1;
-                    log.retries = retries;
-                    log_info!("PATH S: upstream request failed ({msg}); silent retry {retries}");
-                    tokio::time::sleep(st.retry_delay).await;
-                    continue;
-                }
-                log.set(529, "upstream_request_failed");
-                return error_response(
-                    529,
-                    "overloaded_error",
-                    &format!("as-shim: upstream request failed: {msg}"),
-                    None,
-                );
-            }
-        }
+    let (resp, id) = match send_with_retries(&st, "S", &req, &mut retries, log).await {
+        Ok(x) => x,
+        Err(r) => return *r,
     };
+    log.upstream(&resp);
     if !resp.status().is_success() {
         return upstream_error_response(resp, log).await;
     }
@@ -879,20 +1225,18 @@ async fn path_s(
     let mut out_headers = filter_headers(resp.headers(), &[]);
     out_headers.remove(header::CONTENT_LENGTH);
     log.set(status, "client_closed");
+    let up = UpstreamBody::new(&st, resp, id, &req.headers, log);
     let relay = HoldRelay {
         st,
-        method,
-        url,
-        headers,
-        body,
+        req,
         retries,
-        stream: resp.bytes_stream().boxed(),
+        up,
         parser: SseParser::new(),
         held: BytesMut::new(),
         phase: Phase::Hold,
         eof: false,
         fail: None,
-        log,
+        log: log.clone(),
     };
     let stream = futures_util::stream::unfold(relay, |mut r| async move {
         r.next_chunk().await.map(|c| (c, r))
@@ -912,12 +1256,9 @@ enum Phase {
 
 struct HoldRelay {
     st: Arc<AppState>,
-    method: Method,
-    url: String,
-    headers: HeaderMap,
-    body: Bytes,
+    req: UpReq,
     retries: u32,
-    stream: BoxStream<'static, reqwest::Result<Bytes>>,
+    up: UpstreamBody,
     parser: SseParser,
     held: BytesMut,
     phase: Phase,
@@ -947,16 +1288,21 @@ impl HoldRelay {
             match self.phase {
                 Phase::Done => return None,
                 Phase::Pass => {
-                    return match self.stream.next().await {
+                    return match self.up.next().await {
                         Some(Ok(b)) => Some(Ok(b)),
                         Some(Err(e)) => {
                             self.phase = Phase::Done;
-                            self.log.outcome = "upstream_io_error_after_content".into();
-                            Some(Err(std::io::Error::other(describe_reqwest_error(&e))))
+                            self.log.outcome(if self.up.is_resumable() {
+                                "resume_gave_up_after_content"
+                            } else {
+                                "upstream_io_error_after_content"
+                            });
+                            self.log.error(&e);
+                            Some(Err(std::io::Error::other(e)))
                         }
                         None => {
                             self.phase = Phase::Done;
-                            self.log.outcome = "ok".into();
+                            self.log.outcome("ok");
                             None
                         }
                     };
@@ -998,18 +1344,20 @@ impl HoldRelay {
 
     /// Read the next upstream chunk. Returns bytes to emit when HOLD had to be abandoned.
     async fn read_more(&mut self) -> Option<Bytes> {
-        match self.stream.next().await {
+        match self.up.next().await {
             Some(Ok(chunk)) => {
                 self.parser.push(&chunk);
                 if self.parser.pending_len() + self.held.len() > MAX_HOLD_BYTES {
-                    log_warn!("PATH S: more than 8 MiB before any content; passing the stream through");
+                    log_warn!(
+                        "PATH S: more than 8 MiB before any content; passing the stream through"
+                    );
                     let mut out = std::mem::take(&mut self.held);
                     out.extend_from_slice(&self.parser.take_remaining());
                     self.phase = Phase::Pass;
                     return Some(out.freeze());
                 }
             }
-            Some(Err(e)) => self.fail = Some(Failure::Io(describe_reqwest_error(&e))),
+            Some(Err(e)) => self.fail = Some(Failure::Io(e)),
             None => {
                 self.parser.set_eof();
                 self.eof = true;
@@ -1046,28 +1394,40 @@ impl HoldRelay {
 
     async fn handle_failure(&mut self, f: Failure, out: &mut BytesMut) {
         let transient = f.is_transient();
-        if transient && self.st.pre_content_failure(self.retries, self.log.started) {
+        if transient
+            && self
+                .st
+                .pre_content_failure(self.retries, self.log.started())
+        {
             self.retries += 1;
-            self.log.retries = self.retries;
-            log_info!("PATH S: {} before content; silent retry {}", f.outcome(), self.retries);
+            self.log.retries(self.retries);
+            log_info!(
+                "PATH S: {} before content; silent retry {}",
+                f.outcome(),
+                self.retries
+            );
             tokio::time::sleep(self.st.retry_delay).await;
             self.parser = SseParser::new();
             self.held.clear();
             self.eof = false;
+            let req = &self.req;
             match self
                 .st
-                .send(&self.method, &self.url, &self.headers, self.body.clone())
+                .send_messages(&req.method, &req.url, &req.headers, req.body.clone())
                 .await
             {
                 Err(msg) => self.fail = Some(Failure::Io(msg)),
-                Ok(resp)
+                Ok((resp, id))
                     if resp.status().is_success()
                         && is_sse(resp.headers())
                         && !is_encoded(resp.headers()) =>
                 {
-                    self.stream = resp.bytes_stream().boxed();
+                    self.log.upstream(&resp);
+                    // Replacing the old body cancels its server-side buffer.
+                    self.up = UpstreamBody::new(&self.st, resp, id, &self.req.headers, &self.log);
                 }
-                Ok(resp) => {
+                Ok((resp, _)) => {
+                    self.log.upstream(&resp);
                     let status = resp.status().as_u16();
                     let body = read_limited(resp, 64 << 10).await;
                     let (ty, msg) = if status == 524 {
@@ -1088,12 +1448,14 @@ impl HoldRelay {
                     };
                     out.extend_from_slice(&errmap::sse_error_frame(ty, &msg));
                     self.phase = Phase::Done;
-                    self.log.outcome = format!("retry_http_{status}");
+                    self.log.outcome(format!("retry_http_{status}"));
+                    self.log.error(&msg);
                 }
             }
             return;
         }
         let outcome = f.outcome();
+        self.log.error(&f.describe());
         match f {
             Failure::Frame { ref frame, .. } if !transient => {
                 out.extend_from_slice(&as_event_error(frame));
@@ -1108,7 +1470,7 @@ impl HoldRelay {
             }
         }
         self.phase = Phase::Done;
-        self.log.outcome = outcome;
+        self.log.outcome(outcome);
     }
 }
 
@@ -1118,10 +1480,21 @@ mod tests {
 
     #[test]
     fn local_hosts() {
-        for h in ["127.0.0.1:8787", "localhost", "LOCALHOST.:1", "[::1]:8787", "127.3.4.5"] {
+        for h in [
+            "127.0.0.1:8787",
+            "localhost",
+            "LOCALHOST.:1",
+            "[::1]:8787",
+            "127.3.4.5",
+        ] {
             assert!(host_is_local(h), "{h}");
         }
-        for h in ["evil.example:8787", "192.168.1.2", "[::2]:1", "localhost.evil.com"] {
+        for h in [
+            "evil.example:8787",
+            "192.168.1.2",
+            "[::2]:1",
+            "localhost.evil.com",
+        ] {
             assert!(!host_is_local(h), "{h}");
         }
     }

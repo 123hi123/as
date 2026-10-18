@@ -96,13 +96,46 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(upstream: Option<String>, listen: Option<String>, config_path: Option<PathBuf>) -> Result<(), String> {
+fn resume_summary(cfg: &Config) -> String {
+    if cfg.resume {
+        let cap = match cfg.resume_max_silence_secs() {
+            Some(s) => format!("gives up {s}s after the last byte"),
+            None => format!(
+                "idle detection off; gives up {}s after the last byte",
+                cfg.resume_budget_secs
+            ),
+        };
+        format!(
+            "on (idle {}s, budget {}s: {cap})",
+            cfg.resume_idle_secs, cfg.resume_budget_secs
+        )
+    } else {
+        "off".into()
+    }
+}
+
+fn log_summary(cfg: &Config) -> String {
+    match cfg.log_db_path() {
+        Some(p) if cfg.log_retention_days == 0 => format!("{} (kept forever)", p.display()),
+        Some(p) => format!("{} (kept {} days)", p.display(), cfg.log_retention_days),
+        None => "off".into(),
+    }
+}
+
+fn run(
+    upstream: Option<String>,
+    listen: Option<String>,
+    config_path: Option<PathBuf>,
+) -> Result<(), String> {
     let path = config_path.unwrap_or_else(config::default_config_path);
     let mut cfg = match Config::load_optional(&path)? {
         Some(c) => {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 for k in Config::unknown_keys(&text) {
-                    eprintln!("as-shim: warning: unknown config key {k:?} in {} is ignored", path.display());
+                    eprintln!(
+                        "as-shim: warning: unknown config key {k:?} in {} is ignored",
+                        path.display()
+                    );
                 }
             }
             c
@@ -140,15 +173,24 @@ fn run(upstream: Option<String>, listen: Option<String>, config_path: Option<Pat
             as_shim::VERSION,
             cfg.upstream
         );
+        log_info!(
+            "resume: {}; request log: {}",
+            resume_summary(&cfg),
+            log_summary(&cfg)
+        );
+        if let Some(w) = cfg.resume_watchdog_warning() {
+            log_warn!("{w}");
+        }
         let shutdown = async {
-            let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    log_warn!("cannot install SIGTERM handler: {e}");
-                    let _ = tokio::signal::ctrl_c().await;
-                    return;
-                }
-            };
+            let mut term =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log_warn!("cannot install SIGTERM handler: {e}");
+                        let _ = tokio::signal::ctrl_c().await;
+                        return;
+                    }
+                };
             tokio::select! {
                 _ = term.recv() => {}
                 _ = tokio::signal::ctrl_c() => {}

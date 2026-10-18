@@ -37,7 +37,9 @@ fn under_journald() -> bool {
 
 /// UTC timestamp `YYYY-MM-DDTHH:MM:SS.mmmZ` without pulling in a date crate.
 fn timestamp() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs() as i64;
     let ms = now.subsec_millis();
     let days = secs.div_euclid(86_400);

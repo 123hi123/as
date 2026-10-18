@@ -25,8 +25,22 @@ impl Rng {
 }
 
 const TOKENS: &[&[u8]] = &[
-    b"\n", b"\r", b"\r\n", b"\n\n", b"data:", b"data: ", b"event:", b"event: ", b":", b" ", b"x",
-    b"{\"type\":\"error\"}", b"\xff\xfe", b"\xe4\xb8\xad", b"id: 1", b"retry: 5",
+    b"\n",
+    b"\r",
+    b"\r\n",
+    b"\n\n",
+    b"data:",
+    b"data: ",
+    b"event:",
+    b"event: ",
+    b":",
+    b" ",
+    b"x",
+    b"{\"type\":\"error\"}",
+    b"\xff\xfe",
+    b"\xe4\xb8\xad",
+    b"id: 1",
+    b"retry: 5",
 ];
 
 fn gen_sse(r: &mut Rng) -> Vec<u8> {
@@ -48,7 +62,11 @@ fn parse(input: &[u8], r: &mut Rng, chunked: bool) -> (Vec<Parsed>, Vec<u8>) {
     let mut out = vec![];
     let mut i = 0;
     while i < input.len() {
-        let step = if chunked { 1 + r.below(5) as usize } else { input.len() };
+        let step = if chunked {
+            1 + r.below(5) as usize
+        } else {
+            input.len()
+        };
         let end = (i + step).min(input.len());
         p.push(&input[i..end]);
         i = end;
@@ -74,7 +92,12 @@ fn sse_random_lossless_and_chunk_invariant() {
         let mut joined: Vec<u8> = whole.iter().flat_map(|f| f.0.clone()).collect();
         joined.extend_from_slice(&rest_whole);
         assert_eq!(joined, input, "iter {iter}: bytes lost or duplicated");
-        assert_eq!(whole, chunked, "iter {iter}: chunking changed the parse of {:?}", String::from_utf8_lossy(&input));
+        assert_eq!(
+            whole,
+            chunked,
+            "iter {iter}: chunking changed the parse of {:?}",
+            String::from_utf8_lossy(&input)
+        );
         assert_eq!(rest_whole, rest_chunked);
 
         let mut q = SseParser::new();
@@ -109,8 +132,21 @@ fn rand_val(r: &mut Rng, depth: u32) -> Value {
         6 => Value::Array((0..r.below(3)).map(|_| rand_val(r, depth + 1)).collect()),
         _ => {
             const KEYS: &[&str] = &[
-                "type", "index", "text", "thinking", "signature", "partial_json", "citation", "citations",
-                "content", "content_block", "delta", "usage", "message", "input", "stop_reason",
+                "type",
+                "index",
+                "text",
+                "thinking",
+                "signature",
+                "partial_json",
+                "citation",
+                "citations",
+                "content",
+                "content_block",
+                "delta",
+                "usage",
+                "message",
+                "input",
+                "stop_reason",
             ];
             let mut m = Map::new();
             for _ in 0..r.below(5) {
@@ -123,14 +159,30 @@ fn rand_val(r: &mut Rng, depth: u32) -> Value {
 
 fn rand_event(r: &mut Rng) -> (String, Value) {
     const KINDS: &[&str] = &[
-        "message_start", "content_block_start", "content_block_delta", "content_block_stop",
-        "message_delta", "message_stop", "ping", "error", "weird",
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+        "ping",
+        "error",
+        "weird",
     ];
     const DELTAS: &[&str] = &[
-        "text_delta", "thinking_delta", "signature_delta", "input_json_delta", "citations_delta", "future_delta",
+        "text_delta",
+        "thinking_delta",
+        "signature_delta",
+        "input_json_delta",
+        "citations_delta",
+        "future_delta",
     ];
     let kind = r.pick(KINDS).to_string();
-    let mut ev = if r.below(3) == 0 { rand_val(r, 0) } else { json!({}) };
+    let mut ev = if r.below(3) == 0 {
+        rand_val(r, 0)
+    } else {
+        json!({})
+    };
     if let Some(o) = ev.as_object_mut() {
         if r.below(2) == 0 {
             o.insert("index".into(), json!(r.below(3)));
@@ -143,7 +195,10 @@ fn rand_event(r: &mut Rng) -> (String, Value) {
             let dm = d.as_object_mut().unwrap();
             dm.insert("type".into(), json!(*r.pick(DELTAS)));
             if r.below(2) == 0 {
-                dm.insert("partial_json".into(), json!(*r.pick(&["{", "\"a\"", ":1", "}", ""])));
+                dm.insert(
+                    "partial_json".into(),
+                    json!(*r.pick(&["{", "\"a\"", ":1", "}", ""])),
+                );
             }
             o.insert("delta".into(), d);
         }
@@ -151,7 +206,10 @@ fn rand_event(r: &mut Rng) -> (String, Value) {
             o.insert("content_block".into(), rand_val(r, 1));
         }
         if kind == "message_start" && r.below(2) == 0 {
-            o.insert("message".into(), json!({"id": "m", "content": rand_val(r, 1), "usage": rand_val(r, 1)}));
+            o.insert(
+                "message".into(),
+                json!({"id": "m", "content": rand_val(r, 1), "usage": rand_val(r, 1)}),
+            );
         }
     }
     (kind, ev)
@@ -172,7 +230,9 @@ fn aggregator_random_events_never_panic() {
 
 #[test]
 fn errmap_random_bodies_never_panic() {
-    const ALPHABET: &[u8] = &[b'<', b't', b'i', b'l', b'e', b'>', b'/', 0xe4, 0xb8, 0xad, b'T', b'I', 0xff, b' '];
+    const ALPHABET: &[u8] = &[
+        b'<', b't', b'i', b'l', b'e', b'>', b'/', 0xe4, 0xb8, 0xad, b'T', b'I', 0xff, b' ',
+    ];
     let mut r = Rng(12345);
     for _ in 0..20_000 {
         let mut v: Vec<u8> = (0..r.below(80)).map(|_| *r.pick(ALPHABET)).collect();

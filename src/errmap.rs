@@ -143,7 +143,10 @@ pub fn html_title(body: &[u8]) -> Option<String> {
     let start = lower.find("<title")?;
     let open_end = lower[start..].find('>')? + start + 1;
     let end = lower[open_end..].find("</title>")? + open_end;
-    let t = s[open_end..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    let t = s[open_end..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if t.is_empty() {
         None
     } else {
@@ -174,7 +177,10 @@ mod tests {
     #[test]
     fn mapping() {
         assert_eq!(status_for_error_type("rate_limit_error").0, 429);
-        assert_eq!(status_for_error_type("upstream_error"), (529, "overloaded_error"));
+        assert_eq!(
+            status_for_error_type("upstream_error"),
+            (529, "overloaded_error")
+        );
         assert_eq!(status_for_error_type("billing_error").0, 402);
         assert_eq!(error_type_for_status(429), "rate_limit_error");
         assert_eq!(error_type_for_status(524), "overloaded_error");
@@ -190,7 +196,8 @@ mod tests {
 
     #[test]
     fn titles() {
-        let html = b"<html><head><title>api.example.com | 524: A timeout occurred</title></head></html>";
+        let html =
+            b"<html><head><title>api.example.com | 524: A timeout occurred</title></head></html>";
         assert_eq!(
             html_title(html).unwrap(),
             "api.example.com | 524: A timeout occurred"

@@ -42,9 +42,7 @@ impl Frame {
 pub fn parse_json_lenient(s: &str) -> Option<Value> {
     match serde_json::from_str::<Value>(s) {
         Ok(v) => Some(v),
-        Err(_) if s.contains("\\u") => {
-            serde_json::from_str::<Value>(&fix_lone_surrogates(s)).ok()
-        }
+        Err(_) if s.contains("\\u") => serde_json::from_str::<Value>(&fix_lone_surrogates(s)).ok(),
         Err(_) => None,
     }
 }
@@ -160,7 +158,10 @@ impl SseParser {
     pub fn next_frame(&mut self) -> Option<Frame> {
         loop {
             let from = self.scan_pos.max(self.line_start);
-            let Some(found) = self.buf[from..].iter().position(|&b| b == b'\n' || b == b'\r') else {
+            let Some(found) = self.buf[from..]
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r')
+            else {
                 self.scan_pos = self.buf.len();
                 return None;
             };
@@ -246,8 +247,14 @@ mod tests {
         assert_eq!(f.len(), 2);
         assert_eq!(f[0].event.as_deref(), Some("ping"));
         assert_eq!(f[0].data.as_deref(), Some("{\"type\": \"ping\"}"));
-        assert_eq!(&f[0].raw[..], b"event: ping\ndata: {\"type\": \"ping\"}\n\n");
-        assert_eq!(f[1].kind(f[1].json().as_ref()).as_deref(), Some("message_stop"));
+        assert_eq!(
+            &f[0].raw[..],
+            b"event: ping\ndata: {\"type\": \"ping\"}\n\n"
+        );
+        assert_eq!(
+            f[1].kind(f[1].json().as_ref()).as_deref(),
+            Some("message_stop")
+        );
         assert_eq!(p.pending_len(), 0);
     }
 
@@ -276,7 +283,10 @@ mod tests {
         assert_eq!(frames[1].event, None);
         assert_eq!(frames[1].data.as_deref(), Some("x\ny"));
         assert_eq!(frames[2].event.as_deref(), Some("b"));
-        assert_eq!(frames[2].kind(frames[2].json().as_ref()).as_deref(), Some("z"));
+        assert_eq!(
+            frames[2].kind(frames[2].json().as_ref()).as_deref(),
+            Some("z")
+        );
         let joined: Vec<u8> = frames.iter().flat_map(|f| f.raw.to_vec()).collect();
         assert_eq!(joined, input);
     }

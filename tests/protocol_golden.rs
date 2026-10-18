@@ -28,7 +28,9 @@ fn aggregate_chunked(input: &[u8], max_chunk: u64, seed: u64) -> Result<Value, S
     let feed = |p: &mut SseParser, a: &mut Aggregator| -> Result<Option<()>, String> {
         while let Some(f) = p.next_frame() {
             let j = f.json();
-            let Some(kind) = f.kind(j.as_ref()) else { continue };
+            let Some(kind) = f.kind(j.as_ref()) else {
+                continue;
+            };
             if kind == "ping" || kind == "error" {
                 continue;
             }
@@ -59,7 +61,10 @@ fn sse(events: &[Value], with_event_line: bool, eol: &str) -> Vec<u8> {
         if with_event_line {
             out.push_str(&format!("event: {}{eol}", e["type"].as_str().unwrap()));
         }
-        out.push_str(&format!("data: {}{eol}{eol}", serde_json::to_string(e).unwrap()));
+        out.push_str(&format!(
+            "data: {}{eol}{eol}",
+            serde_json::to_string(e).unwrap()
+        ));
     }
     out.into_bytes()
 }
@@ -71,7 +76,9 @@ fn assert_golden(events: &[Value], expected: &Value) {
         let bytes = sse(events, with_event, eol);
         for (max_chunk, seed) in [(u64::MAX, 1), (1, 2), (7, 3), (64, 4)] {
             let got = aggregate_chunked(&bytes, max_chunk.min(bytes.len() as u64), seed)
-                .unwrap_or_else(|e| panic!("aggregate failed ({with_event},{eol:?},{max_chunk}): {e}"));
+                .unwrap_or_else(|e| {
+                    panic!("aggregate failed ({with_event},{eol:?},{max_chunk}): {e}")
+                });
             assert_eq!(
                 &got, expected,
                 "framing event_line={with_event} eol={eol:?} chunk<={max_chunk}\n got: {got}\nwant: {expected}"
@@ -111,7 +118,17 @@ fn golden_docs_tool_use_with_text() {
         json!({"type":"content_block_stop","index":0}),
         json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}),
     ];
-    for part in ["", "{\"location\":", " \"San", " Francisc", "o,", " CA\"", ", ", "\"unit\": \"fah", "renheit\"}"] {
+    for part in [
+        "",
+        "{\"location\":",
+        " \"San",
+        " Francisc",
+        "o,",
+        " CA\"",
+        ", ",
+        "\"unit\": \"fah",
+        "renheit\"}",
+    ] {
         events.push(json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":part}}));
     }
     events.extend([
@@ -389,7 +406,11 @@ garbage-without-terminator \xff\r";
     want.extend_from_slice(tail);
     let mut r = Rng(7);
     for iter in 0..5000 {
-        let max = if iter % 10 == 0 { input.len() as u64 } else { 9 };
+        let max = if iter % 10 == 0 {
+            input.len() as u64
+        } else {
+            9
+        };
         let mut chunks = vec![];
         let mut i = 0;
         while i < input.len() {
@@ -399,6 +420,11 @@ garbage-without-terminator \xff\r";
         }
         let (out, pass) = hold_relay(&chunks);
         assert!(pass);
-        assert_eq!(out, want, "chunking {:?}", chunks.iter().map(|c| c.len()).collect::<Vec<_>>());
+        assert_eq!(
+            out,
+            want,
+            "chunking {:?}",
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>()
+        );
     }
 }

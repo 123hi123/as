@@ -63,7 +63,11 @@ fn systemctl(args: &[&str]) -> Result<String, String> {
     } else {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         Err(if err.is_empty() {
-            format!("systemctl --user {} failed ({})", args.join(" "), out.status)
+            format!(
+                "systemctl --user {} failed ({})",
+                args.join(" "),
+                out.status
+            )
         } else {
             err
         })
@@ -88,7 +92,9 @@ pub fn available() -> bool {
 }
 
 fn systemd_quote(s: &str) -> String {
-    let needs = s.is_empty() || s.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '%' | '$' | ';'));
+    let needs = s.is_empty()
+        || s.chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '%' | '$' | ';'));
     if !needs {
         return s.to_string();
     }
@@ -165,7 +171,8 @@ pub fn remove() -> Result<bool, String> {
         let _ = systemctl(&["daemon-reload"]);
         let _ = systemctl(&["reset-failed", &name]);
     } else if existed {
-        std::fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
     }
     Ok(existed)
 }
@@ -192,8 +199,16 @@ pub fn state() -> String {
         .unwrap_or_default();
     format!(
         "{name}: {}, {}",
-        if active.is_empty() { "unknown" } else { &active },
-        if enabled.is_empty() { "not-found" } else { &enabled }
+        if active.is_empty() {
+            "unknown"
+        } else {
+            &active
+        },
+        if enabled.is_empty() {
+            "not-found"
+        } else {
+            &enabled
+        }
     )
 }
 
@@ -222,7 +237,10 @@ mod tests {
         assert_eq!(systemd_quote("/usr/bin/as-shim"), "/usr/bin/as-shim");
         assert_eq!(systemd_quote("/home/a b/x"), "\"/home/a b/x\"");
         assert_eq!(systemd_quote("/h/100%"), "\"/h/100%%\"");
-        let u = unit_text(Path::new("/home/user/.local/bin/as-shim"), Path::new("/c/config.toml"));
+        let u = unit_text(
+            Path::new("/home/user/.local/bin/as-shim"),
+            Path::new("/c/config.toml"),
+        );
         assert!(u.contains("ExecStart=/home/user/.local/bin/as-shim run --config /c/config.toml\n"));
         assert!(u.contains("Restart=on-failure"));
     }

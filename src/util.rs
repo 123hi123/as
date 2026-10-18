@@ -60,6 +60,14 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Wall-clock milliseconds since the Unix epoch.
+pub fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -75,7 +83,10 @@ mod tests {
         std::os::unix::fs::symlink(&real, &link).unwrap();
         super::write_atomic(&link, b"new", Some(0o600)).unwrap();
         assert_eq!(std::fs::read(&real).unwrap(), b"new");
-        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(
             std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
             0o640
