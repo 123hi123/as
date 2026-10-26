@@ -2058,3 +2058,36 @@ async fn completed_requests_send_only_the_ack() {
         assert!(dels[0].path.ends_with("?reason=ack"), "{}", dels[0].path);
     }
 }
+
+// ------------------------------------------------------------------------------ sanitize
+
+#[tokio::test]
+async fn sanitize_strips_synthetic_and_refusal_before_upstream() {
+    let m = mock(|_, _| Reply::sse(&[text_frames("ok")[0].as_str(), "<EOF>"])).await;
+    let port = shim(m.port, |_| {}).await;
+    let mut b = body(true);
+    b["messages"][0]["content"] = json!([
+        {"type": "text", "text": "hi"},
+        {"type": "tool_result", "tool_use_id": "t1",
+         "content": "API Error: 400 Anthropic refused this request under its usage policy. Do not retry this request."}
+    ]);
+    b["messages"].as_array_mut().unwrap().push(json!(
+        {"role": "assistant", "model": "<synthetic>",
+         "content": [{"type": "text",
+                      "text": "API Error: Anthropic refused this request under its usage policy. Do not retry this request."}]}
+    ));
+    let resp = post(port, &b).await;
+    assert_eq!(resp.status(), 200);
+    let seen = m.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    let sent: Value = serde_json::from_slice(&seen[0].body).unwrap();
+    let msgs = sent["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 1, "synthetic message must be dropped: {msgs:?}");
+    let contents = &msgs[0]["content"];
+    assert!(
+        !serde_json::to_string(contents)
+            .unwrap()
+            .contains("Anthropic refused"),
+        "marker must be blanked before the request leaves: {contents:?}"
+    );
+}

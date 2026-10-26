@@ -11,6 +11,7 @@ pub mod errmap;
 pub mod logdb;
 pub mod proxy;
 pub mod resume;
+pub mod sanitize;
 pub mod service;
 pub mod setup;
 pub mod sse;

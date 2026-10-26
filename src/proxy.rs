@@ -808,7 +808,7 @@ async fn passthrough(st: Arc<AppState>, req: Request, log: &ReqLog) -> Response 
 
 async fn messages(st: Arc<AppState>, req: Request, log: &ReqLog) -> Response {
     let (parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, st.max_body).await {
+    let mut bytes = match axum::body::to_bytes(body, st.max_body).await {
         Ok(b) => b,
         Err(e) => {
             let too_large = std::error::Error::source(&e)
@@ -833,8 +833,8 @@ async fn messages(st: Arc<AppState>, req: Request, log: &ReqLog) -> Response {
     };
     let headers = messages_upstream_headers(&parts.headers);
     let url = st.url(&parts.uri);
-    let obj = match serde_json::from_slice::<Value>(&bytes) {
-        Ok(Value::Object(m)) => m,
+    let mut root = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(Value::Object(m)) => Value::Object(m),
         _ => {
             log.mode("passthrough");
             return match st.send(&parts.method, &url, &headers, bytes).await {
@@ -859,6 +859,12 @@ async fn messages(st: Arc<AppState>, req: Request, log: &ReqLog) -> Response {
             };
         }
     };
+    let sanitized = crate::sanitize::sanitize_messages(&mut root);
+    if sanitized {
+        bytes = Bytes::from(serde_json::to_vec(&root).unwrap_or_default());
+        log.outcome("sanitized");
+    }
+    let obj = root.as_object_mut().expect("just parsed as object");
     let stream = obj.get("stream") == Some(&Value::Bool(true));
     let model = obj
         .get("model")
@@ -880,9 +886,8 @@ async fn messages(st: Arc<AppState>, req: Request, log: &ReqLog) -> Response {
         path_s(st, req, log).await
     } else {
         log.mode("N");
-        let mut obj = obj;
         obj.insert("stream".into(), Value::Bool(true));
-        let body = Bytes::from(serde_json::to_vec(&Value::Object(obj)).unwrap_or_default());
+        let body = Bytes::from(serde_json::to_vec(&Value::Object(obj.clone())).unwrap_or_default());
         path_n(
             st,
             UpReq {

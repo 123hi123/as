@@ -62,6 +62,17 @@ as-shim 從 client 端處理這兩種狀況：
 
 驗證身分用的是原請求的 `x-api-key`（或 `Authorization: Bearer`）；續傳與刪除請求帶同一個憑證，別人拿到 id 也沒用。as-shim 不會把憑證或 body 寫進任何 log。
 
+## 上游前的請求淨化（sanitize）
+
+Claude Code 會把 API 錯誤寫進 session 歷史，最麻煩的是 `"API Error: Anthropic refused this request under its usage policy."` 這種被寫成正式訊息的（`model: "<synthetic>"` 的 assistant 訊息，或含錯誤文字的 `tool_result`）。這些訊息之後每個請求都會跟著送上去，可能反覆觸發 usage policy 拒絕。
+
+as-shim 在請求往上游送之前會自動：
+
+1. 移除 `model: "<synthetic>"` 的訊息；
+2. 把任何 content 裡的 `Anthropic refused this request under its usage policy. Do not retry this request.` 字樣換成 `[error]`（tool_use / tool_result 配對結構不動）。
+
+回應方向的錯誤照舊由 errmap 正規化成標準 Anthropic 錯誤類型，不需要另外處理。
+
 ## `setup` 做了什麼
 
 1. **決定上游 URL。** 預設依序取：Claude Code `settings.json` 裡的 `env.ANTHROPIC_BASE_URL` → 之前設定過的上游 → 環境變數 `ANTHROPIC_BASE_URL`。如果 settings 已經指向 127.0.0.1，就沿用之前的上游。
