@@ -210,7 +210,7 @@ pub fn health(port: u16, timeout: Duration) -> Result<Health, String> {
     })
 }
 
-fn wait_healthy(port: u16, upstream: &str, secs: u64) -> Result<Health, String> {
+pub fn wait_healthy(port: u16, upstream: &str, secs: u64) -> Result<Health, String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(secs);
     loop {
         let last = match health(port, Duration::from_millis(800)) {

@@ -98,6 +98,7 @@ as-shim 在請求往上游送之前會自動：
 | `as-shim status` | 顯示設定、服務狀態、健康檢查、Claude Code 目前指向哪裡 |
 | `as-shim set-upstream <URL>` | 換上游並重啟服務 |
 | `as-shim uninstall [--yes]` | 停用並刪除服務、還原 Claude Code 設定、刪除設定檔 |
+| `as-shim update` | 從 GitHub 最新 release 下載新 binary（SHA256 驗證後自替換），裝有 systemd 服務時自動重啟並做健康檢查。可用 `AS_SHIM_DOWNLOAD_BASE` 覆寫下載來源 |
 | `as-shim --version` | 顯示版本 |
 
 ## 設定檔

@@ -1,5 +1,5 @@
 use as_shim::config::{self, Config};
-use as_shim::{log_error, log_info, log_warn, proxy, setup};
+use as_shim::{log_error, log_info, log_warn, proxy, setup, update};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -60,6 +60,8 @@ enum Cmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+    /// Download the latest release and replace the running binary
+    Update,
 }
 
 fn main() -> ExitCode {
@@ -86,6 +88,7 @@ fn main() -> ExitCode {
         Cmd::Status => setup::status(),
         Cmd::SetUpstream { url } => setup::set_upstream(&url),
         Cmd::Uninstall { yes } => setup::uninstall(yes),
+        Cmd::Update => update::update(),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

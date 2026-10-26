@@ -15,6 +15,7 @@ pub mod sanitize;
 pub mod service;
 pub mod setup;
 pub mod sse;
+pub mod update;
 pub mod util;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
